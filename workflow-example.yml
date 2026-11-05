@@ -1,0 +1,23 @@
+# 目标仓库放这里的副本: .github/workflows/reviewer-recommend.yml
+name: reviewer-recommend
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    steps:
+      # 本地 action（uses: ./...）必须先 checkout；远程 uses: owner/repo@v1 也建议
+      # 显式 checkout（fetch-depth: 0 需要全量历史），action 内部的 checkout 是幂等的
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/reviewer-recommender   # 或 uses: YOUR_FORK/pr-reviewer-recommender@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          top-n: '3'

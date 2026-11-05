@@ -1,0 +1,9 @@
+[project]
+name = "pr-reviewer-recommender"
+version = "0.1.0"
+description = "Recommend PR reviewers from module ownership and history (Apache IoTDB / TsFile)"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

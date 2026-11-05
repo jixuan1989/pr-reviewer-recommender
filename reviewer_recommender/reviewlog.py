@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+"""GitHub review history + identity resolution (login <-> git author).
+
+All GitHub access goes through the `gh` CLI (present on Action runners).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import subprocess
+import time
+from collections import defaultdict
+
+from .config import Config
+from .modules import ModuleMap
+
+_PR_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: 50, after: $cursor,
+                 orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { endCursor hasNextPage }
+      nodes {
+        number
+        title
+        createdAt
+        author { login }
+        files(first: 100) { nodes { path } }
+        reviews(first: 100) {
+          nodes { author { login } state submittedAt }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def gh_api(args: list[str], retries: int = 3, cwd: str | None = None) -> str:
+    gh = os.environ.get("GH_BIN", "gh")
+    last_err = ""
+    for attempt in range(retries):
+        proc = subprocess.run([gh, *args], capture_output=True, text=True, cwd=cwd)
+        if proc.returncode == 0:
+            return proc.stdout
+        last_err = proc.stderr[:300]
+        time.sleep(2 * (attempt + 1))  # transient network / rate-limit backoff
+    raise RuntimeError(f"gh {' '.join(args[:2])} failed: {last_err}")
+
+
+def fetch_merged_prs(owner: str, name: str, max_prs: int = 100) -> list[dict]:
+    """Most recent merged PRs: number, createdAt, author, files, reviews."""
+    out: list[dict] = []
+    cursor: str | None = None
+    while len(out) < max_prs:
+        args = ["api", "graphql", "-f", f"query={_PR_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"]
+        if cursor:
+            args += ["-f", f"cursor={cursor}"]
+        raw = gh_api(args)
+        data = json.loads(raw)["data"]["repository"]["pullRequests"]
+        out.extend(data["nodes"])
+        if not data["pageInfo"]["hasNextPage"] or not data["nodes"]:
+            break
+        cursor = data["pageInfo"]["endCursor"]
+    return out[:max_prs]
+
+
+def review_events(
+    prs: list[dict], mmap: ModuleMap, cfg: Config, ref: dt.datetime
+) -> list[tuple[str, str, dt.datetime]]:
+    """Raw (login, module, when) review events — parameter-independent, for tuning reuse."""
+    evs: list[tuple[str, str, dt.datetime]] = []
+    for pr in prs:
+        if pr["createdAt"] >= ref.isoformat():
+            continue  # only history before the reference point (no leakage)
+        modules = cfg.touched_modules(mmap.of(f["path"]) for f in pr["files"]["nodes"])
+        for rv in pr["reviews"]["nodes"]:
+            login = (rv["author"] or {}).get("login")
+            if not login or cfg.is_bot(login):
+                continue
+            if rv["state"] not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+                continue
+            when = dt.datetime.fromisoformat(rv["submittedAt"].replace("Z", "+00:00"))
+            if when > ref:
+                continue
+            for m in modules:
+                evs.append((login.lower(), m, when))
+    return evs
+
+
+def review_signals(
+    prs: list[dict], mmap: ModuleMap, cfg: Config, ref: dt.datetime
+) -> dict[tuple[str, str], tuple[int, float]]:
+    """(reviewer_login, module) -> (count, decayed weight)."""
+    acc: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for login, m, when in review_events(prs, mmap, cfg, ref):
+        acc[(login, m)].append(cfg.decay(when, ref))
+    return {k: (len(ws), sum(ws)) for k, ws in acc.items()}
+
+
+def fetch_pending_reviews(owner: str, name: str) -> dict[str, int]:
+    """login -> number of open PRs currently awaiting their review (v2 workload signal)."""
+    pending: dict[str, int] = defaultdict(int)
+    page = 1
+    while page <= 10:  # hard cap: 1000 open PRs
+        raw = gh_api(["api", f"repos/{owner}/{name}/pulls?state=open&per_page=100&page={page}"])
+        batch = json.loads(raw)
+        if not batch:
+            break
+        for pr in batch:
+            for rv in pr.get("requested_reviewers") or []:
+                login = (rv or {}).get("login")
+                if login:
+                    pending[login.lower()] += 1
+        if len(batch) < 100:
+            break
+        page += 1
+    return dict(pending)
+
+
+def build_identity_map(owner: str, name: str, commits_to_scan: int = 500) -> dict[str, str]:
+    """git email/name -> github login, resolved via the commits API (server-side email match)."""
+    email_map: dict[str, str] = {}
+    name_map: dict[str, str] = {}
+    page = 1
+    scanned = 0
+    while scanned < commits_to_scan and page <= 10:
+        raw = gh_api([
+            "api", "-X", "GET", f"repos/{owner}/{name}/commits",
+            "-f", "per_page=100", "-f", f"page={page}",
+        ])
+        batch = json.loads(raw)
+        if not batch:
+            break
+        for c in batch:
+            login = (c.get("author") or {}).get("login")
+            info = c.get("commit", {}).get("author", {}) or {}
+            email, gname = info.get("email", ""), info.get("name", "")
+            if login:
+                if email:
+                    email_map[email.lower()] = login
+                if gname:
+                    name_map[gname.strip().lower()] = login
+        scanned += len(batch)
+        page += 1
+    return {"email": email_map, "name": name_map}
+
+
+def canonical_identities(history, identity: dict) -> dict[str, str]:
+    """Map each 'Name <email>' history key -> login (or best-effort name)."""
+    out: dict[str, str] = {}
+    emap, nmap = identity["email"], identity["name"]
+    for who in history:
+        name, _, email = who.rpartition(" <")
+        email = email.rstrip(">").lower()
+        login = emap.get(email) or nmap.get(name.strip().lower())
+        out[who] = login or name.strip()
+    return out
