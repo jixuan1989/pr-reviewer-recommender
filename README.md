@@ -161,13 +161,23 @@ by a "Low confidence" note.
 
 ### What has been run on GitHub
 
-On 2026-11-25, on a fork of apache/tsfile: the vendored form on `pull_request_target`
-and on `pull_request` (a same-repository PR), the remote form on
-`pull_request_target` with the previously published version, a comment created and
-edited in place, the failed-review-request path, and the comment-only mode. Not run
-on GitHub so far: a review request that succeeds — the fork has no collaborators;
-and a PR from another repository on `pull_request` — the read-only token case. Both
-are covered by tests that drive the real `gh` CLI against a fake API.
+On 2026-11-26, on a fork of apache/tsfile, with this version referenced by its
+commit SHA from a workflow on the default branch: `pull_request_target` triggered by
+`opened`, by `ready_for_review` (a draft marked ready) and by `edited` (on a closed
+PR); the checkout of the PR's base commit where it differs from the default
+branch's tip; review requests refused by GitHub (HTTP 422, the fork has no
+collaborators) and reported as such in the comment; a comment left by the earlier,
+Chinese version replaced in place; the comment-only mode; and the dry-run mode,
+which wrote nothing.
+
+Not run on GitHub so far: a review request that succeeds — the fork has no
+collaborators; a PR from another repository on `pull_request` — the read-only token
+case; and, in English, the creating of a new comment. The last one was left out on
+purpose: on that fork a new comment would have pinged the people it names, so the
+runs above wrote through the edit path and the dry run. A day earlier, on
+2026-11-25, the same code as it stood then also ran in the vendored form on
+`pull_request` (a same-repository PR) and created a new comment. All three open
+cases are covered by tests that drive the real `gh` CLI against a fake API.
 
 Needs a GitHub-hosted runner (for the preinstalled `gh`), Python 3.10+ and no
 third-party Python package.

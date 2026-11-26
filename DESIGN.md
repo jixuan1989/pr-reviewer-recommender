@@ -250,14 +250,32 @@ tsfile 用 action 的语料量（`--scan-prs 100 --max-prs 50`）：16 个 PR，
   之后在 fork 上测试，测试分支里先去掉上游的 workflow，11-25 就只触发本 action 了。
 - fork 上的 Copilot 自动代码审查会在 PR 转为 ready for review 时被触发一次；`edited` 事件不会触发它。
 
-**在真实 GitHub 上跑过的**：本地 action 形态在 `pull_request`（同仓 PR）和 `pull_request_target` 上；
-远程形态在 `pull_request_target` 上（用的是当时已发布的版本）；评论的新建、就地编辑、删除；
-请求被拒的路径；只评论模式；base 提交落后于默认分支时身份扫描的区分性场景。
+**2026-11-26**（同一个 fork，推送到 `review-fixes` 分支的版本 `896a82b`，远程形态，按提交 SHA 引用）：
+
+- **按提交 SHA 引用的远程 action，提交只在非默认分支上也能解析**（当时 `main` 还是旧版）。日志里是
+  `Download action repository '…/pr-reviewer-recommender@896a82b…' (SHA:896a82b…)`；`actions/checkout` 那一行
+  解析出的 SHA 与 `action.yml` 里钉的一致。
+- **`pull_request_target` 的三种事件类型都触发了**：非 draft 的 PR `opened`；draft 转 ready 的
+  `ready_for_review`；**已关闭 PR 上的 `edited`**。
+- 检出的是 PR 的 base 提交而不是默认分支顶端：演示 PR 的两次运行里，默认分支顶端分别是 `a2d44aa8` 和
+  `03687b7c`，日志里都是 `HEAD is now at 12e39fe9`（它自己的 base 提交）。
+- 旧版本留下的中文标题评论被就地替换：两次运行都是 `updated recommendation comment … in place`，
+  PR 上仍然只有一条评论；时间线（REST 口径）在两次编辑后新增 0 条。
+- 请求 reviewer 被 GitHub 拒绝（422，非协作者），评论如实写了
+  `Could not request a review from … (Reviews may only be requested from collaborators. (HTTP 422)); add … in the Reviewers box.`
+- 只评论模式和试运行模式都按预期：前者不发请求；后者的日志是 `dry-run: nothing was posted and no reviewer was requested`。
+- Copilot 自动审查在非 draft 的 PR `opened` 时就被触发了一次（11-25 只观察到 `ready_for_review` 会触发）。
+- 测试 PR 只用了试运行模式：在 fork 上发一条新评论会 @ 到评论里点名的真实维护者。
+
+**在真实 GitHub 上跑过的**：远程形态在 `pull_request_target` 上，`opened` / `ready_for_review` / `edited`
+三种事件类型（包括已关闭的 PR）；按提交 SHA 引用 action；本地 action 形态在 `pull_request`（同仓 PR）和
+`pull_request_target` 上（11-25）；评论的新建（11-25，中文文案）、就地编辑、替换旧版本的评论；请求被拒的路径；
+只评论模式；试运行模式；base 提交落后于默认分支时检出与身份扫描的区分性场景。
 
 **没在真实 GitHub 上跑过的**：请求 reviewer **成功**的路径（fork 没有协作者）；
 跨仓库 fork PR + `pull_request` 的只读 403 路径（单个账号构造不出来）；
-`pull_request_target` 下的 `opened` / `ready_for_review` 事件类型（实测只有 `edited` 产生了运行）。
-前两条由「真实 `gh` + 假 API」的集成测试覆盖。
+英文文案下**新建**评论的路径（11-26 的两次真实写入走的都是就地编辑）。
+前两条由「真实 `gh` + 假 API」的集成测试覆盖；第三条与就地编辑只差一个 API 调用，同样有集成测试。
 
 ## 10. v2 / v2.1 的内容（2026-11-05）
 
@@ -288,7 +306,7 @@ tsfile 用 action 的语料量（`--scan-prs 100 --max-prs 50`）：16 个 PR，
 ## 11. 局限 / 待办
 
 - **调参有选择偏差**：默认参数来自在同一批样本上的网格，没有做配对显著性检验（§8）。
-- **三件事没在真实 GitHub 上跑过**（§9 末尾），其中两条路径只有集成测试覆盖。
+- **三件事没在真实 GitHub 上跑过**（§9 末尾），都只有集成测试覆盖。
 - **本地 action 形态要求 base 分支上已经有 action 目录**。在 action 加入之前切出去的发布分支没有它，
   这些分支上的 PR 要用远程形态。iotdb 有 26% 的 PR 打到非默认分支。
 - **回测的简化**：历史统一从默认分支的克隆里读，模块图和依赖图取自克隆 HEAD，负载信号不回溯（§5）。
@@ -330,3 +348,4 @@ tsfile 用 action 的语料量（`--scan-prs 100 --max-prs 50`）：16 个 PR，
 - 折叠区里的评分说明补上了负载一项（待审请求多的人排名靠后），此前只提了 commit、review 和跨模块加分。
 - README 里的评论样例由测试对着代码输出逐字比对（`test_readme_shows_what_the_action_renders`），
   改了渲染代码而忘了改文档会让测试失败。
+- 这一版在 2026-11-26 于真实 GitHub 上跑过，记录见 §9 末尾。
