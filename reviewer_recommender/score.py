@@ -60,6 +60,9 @@ def recommend(
 
     pr_key = _author_key(pr_author) if pr_author else None
     modules_s = set(modules)
+    # Iterate in a fixed order: set order differs from one process to the next
+    # (hash randomisation), and the comment must be the same on every run.
+    order = sorted(modules_s)
 
     for name, h in history.items():
         if cfg.is_bot(name):
@@ -71,7 +74,7 @@ def recommend(
 
         c = Candidate(name=name, last_active=h.last_active)
         touched_all = True
-        for m in modules_s:
+        for m in order:
             ms = h.modules.get(m)
             if ms is None:
                 touched_all = False  # must precede any continue, else coupling leaks
@@ -91,7 +94,7 @@ def recommend(
             ) * (len(modules_s) - 1)
         # v2: dependency-seam bonus — history on both sides of a module boundary
         if dep_adj:
-            for m in modules_s:
+            for m in order:
                 hm = h.modules.get(m)
                 if not hm:
                     continue

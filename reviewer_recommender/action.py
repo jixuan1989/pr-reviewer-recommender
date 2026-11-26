@@ -1,193 +1,419 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GitHub Action entrypoint.
+"""GitHub Action entrypoint: recommend reviewers for one pull request.
 
-Env contract (from composite action):
-  GITHUB_REPOSITORY   owner/name
-  PR_NUMBER           the pull request number
-  GITHUB_TOKEN        token with pull-requests:write
-  TOP_N / DRY_RUN / WINDOW_DAYS   optional overrides
+Environment (set by the composite action, see action.yml):
+  GITHUB_REPOSITORY   owner/name of the base repository
+  PR_NUMBER           number of the pull request
+  GITHUB_TOKEN        token with pull-requests: write
+  TOP_N, WINDOW_DAYS  optional overrides
+  REQUEST_REVIEWERS   "false" -> comment only (default: also request reviewers)
+  DRY_RUN             "true"  -> print everything, write nothing
 
-The repo workspace is expected to be checked out with full history.
+Only the base-branch checkout is read from disk and pull request data is
+treated as data, so the action is safe on `pull_request_target` (code from the
+PR is never run).
+
+Modes:
+  dry-run                  print the comment and who would be requested
+  request-reviewers=false  post (or update in place) the comment only
+  default                  comment + one review request per recommended reviewer
+
+Reviewers are requested *before* the comment is rendered, and the comment
+reports what actually happened; it never claims a request that failed. A
+comment that cannot be posted is an error (exit 1) rather than a warning: a
+run that silently posts nothing looks like a run that worked.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
+import re
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Config, UNASSIGNED
 from .deps import build_dep_graph
-from .history import collect_history
+from .history import collect_history, head_commit, parse_time
 from .modules import build_module_map
 from .reviewlog import (
-    build_identity_map,
-    canonical_identities,
+    GhError,
+    build_identity_index,
     fetch_merged_prs,
     fetch_pending_reviews,
     gh_api,
+    gh_json,
+    gh_json_values,
+    is_bot_account,
+    merge_identities,
+    pr_files,
     review_signals,
+    unresolved_authors,
 )
-from .score import recommend
+from .score import Candidate, recommend
 
-GITHUB_API = "https://api.github.com"
+MARKER = "## 🤖 Suggested reviewers"
+# The title the comment carried before 2026-11-26, when it was written in
+# Chinese. A re-run replaces such a comment instead of adding a second one.
+OLD_MARKERS = ("## 🤖 Reviewer 推荐",)
+HISTORY_PRS = 100   # most recent merged PRs used as the review corpus
+
+
+@dataclass
+class Requests:
+    """What was (or, in dry-run, would be) done about review requests."""
+    enabled: bool
+    dry_run: bool
+    requested: list[str] = field(default_factory=list)
+    already: list[str] = field(default_factory=list)     # were on the PR already
+    failed: list[tuple[str, str]] = field(default_factory=list)   # (login, reason)
 
 
 def main() -> int:
-    repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
-    pr_number = os.environ.get("PR_NUMBER", "")
-    if not repo_slug or not pr_number:
-        print("error: GITHUB_REPOSITORY / PR_NUMBER env not set", file=sys.stderr)
+    slug = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    pr_number = os.environ.get("PR_NUMBER", "").strip()
+    if "/" not in slug or not pr_number.isdigit():
+        print("error: GITHUB_REPOSITORY (owner/name) and PR_NUMBER must be set", file=sys.stderr)
         return 2
-    owner, name = repo_slug.split("/", 1)
-    cfg = Config(
-        top_n=max(2, int(os.environ.get("TOP_N", "3"))),
-        window_days=int(os.environ.get("WINDOW_DAYS", "365")),
-    )
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    owner, name = slug.split("/", 1)
+    try:
+        cfg = Config(top_n=_env_int("TOP_N", 3), window_days=_env_int("WINDOW_DAYS", 365))
+        if cfg.window_days <= 0:
+            raise ValueError("WINDOW_DAYS must be positive")
+        dry_run = _env_flag("DRY_RUN")
+        request = _env_flag("REQUEST_REVIEWERS", default=True)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
-    workspace = Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve()
-    pr = _pr_json(owner, name, pr_number)
-    files = [f["path"] for f in pr["files"]]
-    pr_author = (pr["author"] or {}).get("login")
-    ref = dt.datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+    try:
+        return _run(owner, name, int(pr_number), cfg, dry_run, request)
+    except GhError as e:
+        print(f"error: {e}", file=sys.stderr)
+        if hint := _hint(e):
+            print(f"hint: {hint}", file=sys.stderr)
+        return 1
 
+
+def _run(owner: str, name: str, pr_number: int, cfg: Config, dry_run: bool, request: bool) -> int:
+    workspace = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd()).resolve()
+    pr = _pr_info(owner, name, pr_number)
+    author = pr["author"]
+    if author and is_bot_account({"login": author, "type": pr["authorType"]}, cfg):
+        print(f"PR #{pr_number}: opened by a bot (@{author}), nothing to recommend")
+        return 0
+    ref = parse_time(pr["createdAt"])
+
+    files = pr_files(owner, name, pr_number)
+    if not files:
+        print(f"PR #{pr_number}: no changed files, nothing to recommend")
+        return 0
     mmap = build_module_map(workspace)
     modules = cfg.touched_modules(mmap.of(f) for f in files)
+    print(f"PR #{pr_number} by @{author or '?'}: {len(files)} files -> {', '.join(modules)}")
+    if pr["changedFiles"] > len(files):
+        print(f"note: GitHub lists {pr['changedFiles']} changed files; the API returned {len(files)}")
 
-    print(f"PR #{pr_number} [{pr['title'][:50]}] modules: {modules}")
-    raw_hist = collect_history(workspace, mmap, cfg, ref, before=pr["createdAt"])
-    ident = build_identity_map(owner, name, commits_to_scan=800)
-    history = {k.lower(): v for k, v in _canonical(raw_hist, ident).items()}
-    rsig = review_signals(fetch_merged_prs(owner, name, max_prs=100), mmap, cfg, ref)
-    dep_adj = build_dep_graph(workspace, mmap).adj
+    since = (ref - dt.timedelta(days=cfg.window_days)).isoformat()
+    base = head_commit(workspace)
+    raw = collect_history(workspace, mmap, cfg, ref, before=pr["createdAt"])
+    # Identities come from the commits reachable from `base`. Asked without a
+    # ref, the API lists the default branch: another history when the PR
+    # targets another branch, and its authors then count as unlinked.
+    ident = build_identity_index(owner, name, since, until=pr["createdAt"], ref=base)
+    history = merge_identities(raw, ident)
+    kept = sum(h.total_commits for h in history.values())
+    dropped = unresolved_authors(raw, ident, cfg)
+    print(
+        f"history: {kept} commits by {len(history)} accounts in the last {cfg.window_days} days; "
+        f"{len(dropped)} git author(s) without a linked GitHub account dropped"
+        + (f" ({', '.join(dropped[:8])}{'…' if len(dropped) > 8 else ''})" if dropped else "")
+        + f"; identity scan: {ident.commits_scanned} commits"
+        + (" (scan limit reached)" if ident.truncated else "")
+        + (f", {ident.ambiguous} ambiguous" if ident.ambiguous else "")
+    )
+
+    rsig = review_signals(fetch_merged_prs(owner, name, max_prs=HISTORY_PRS), mmap, cfg, ref)
     pending = fetch_pending_reviews(owner, name)
-    cands = recommend(modules, history, rsig, cfg, ref, pr_author=pr_author,
+    dep_adj = build_dep_graph(workspace, mmap).adj
+    cands = recommend(modules, history, rsig, cfg, ref, pr_author=author or None,
                       dep_adj=dep_adj, pending=pending)
-
     if not cands:
-        print("no candidates survived filtering; skip comment")
+        print("no candidate survived filtering; nothing to post")
         return 0
 
-    body = _render(cands, modules, cfg, pr_number)
-    print(body, "\n")
-
+    top = cands[: cfg.effective_top_n()]
+    outcome = _request_reviewers(owner, name, pr_number, top, pr["reviewers"], request, dry_run)
+    body = _render(top, modules, cfg, outcome, ident)
+    print(f"--- comment ---\n{body}\n---------------")
     if dry_run:
-        print("(dry-run: no comment, no review request)")
+        print("dry-run: nothing was posted and no reviewer was requested")
         return 0
-
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(body)
-        path = f.name
-    prior = _existing_comment_id(owner, name, pr_number, str(workspace))
-    if prior:
-        gh_api(["api", "-X", "PATCH", f"repos/{owner}/{name}/issues/comments/{prior}",
-                "-F", f"body=@{path}"], cwd=str(workspace))
-        print(f"updated existing recommendation comment {prior}")
-    else:
-        gh_api(["pr", "comment", pr_number, "--body-file", path], cwd=str(workspace))
-
-    reviewers = [c for c in (c.key for c in cands[: cfg.top_n])]
-    if reviewers:
-        try:
-            gh_api([
-                "api", "-X", "POST",
-                f"repos/{owner}/{name}/pulls/{pr_number}/requested_reviewers",
-                "-f", f"reviewers={','.join(reviewers)}",
-            ])
-            print(f"requested reviewers: {reviewers}")
-        except RuntimeError as e:
-            # e.g. reviewers are not collaborators of this fork — non-fatal
-            print(f"warning: could not request reviewers ({e}); comment still posted")
+    _post_comment(owner, name, pr_number, body)
     return 0
 
 
-def _pr_json(owner: str, name: str, pr_number: str) -> dict:
-    raw = gh_api([
-        "pr", "view", pr_number, "--repo", f"{owner}/{name}",
-        "--json", "files,author,createdAt,title,number",
+# ---------- inputs ----------
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not an integer") from None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{name}={raw!r}: expected true or false")
+
+
+def _hint(err: GhError) -> str:
+    low = err.stderr.lower()
+    if err.status == 403 and "rate limit" in low:
+        return "GitHub rate limit reached; re-run the job later."
+    if err.status in (403, 404):
+        return (
+            "the token was not allowed to do this. On PRs opened from a fork, GITHUB_TOKEN is "
+            "read-only while the workflow runs on `pull_request`: trigger it on "
+            "`pull_request_target` instead, or pass a PAT / GitHub App token (README, "
+            "\"Usage as a GitHub Action\"). Otherwise check the token has pull-requests: write."
+        )
+    return ""
+
+
+# ---------- pull request ----------
+
+def _pr_info(owner: str, name: str, pr_number: int) -> dict:
+    """author, createdAt, changedFiles and the reviewers already requested."""
+    data = gh_json([
+        "api", f"repos/{owner}/{name}/pulls/{pr_number}", "--jq",
+        "{author: .user.login, authorType: .user.type, createdAt: .created_at,"
+        " changedFiles: .changed_files, reviewers: [.requested_reviewers[]?.login]}",
     ])
-    return json.loads(raw)
+    reviewers = {r.lower() for r in data.get("reviewers") or [] if r}
+    return {
+        "author": (data.get("author") or "").lower(),
+        "authorType": data.get("authorType"),
+        "createdAt": data["createdAt"],
+        "changedFiles": data.get("changedFiles") or 0,
+        "reviewers": reviewers,
+    }
 
 
-def _existing_comment_id(owner: str, name: str, pr_number: str, cwd: str) -> int | None:
-    """Id of our own recommendation comment, if the PR already has one (edit-in-place)."""
-    raw = gh_api(["api", f"repos/{owner}/{name}/issues/{pr_number}/comments"], cwd=cwd)
-    for c in json.loads(raw):
-        author = str((c.get("user") or {}).get("login", ""))
-        if author.startswith("github-actions") and c.get("body", "").startswith("## 🤖 Reviewer 推荐"):
-            return c["id"]
-    return None
-
-
-def _canonical(history, ident):
-    from .history import AuthorHistory  # local import to avoid cycle at module load
-
-    out: dict[str, AuthorHistory] = {}
-    who_map = canonical_identities(history, ident)
-    for who, h in history.items():
-        tgt = out.setdefault(who_map[who], AuthorHistory())
-        tgt.total_commits += h.total_commits
-        if h.last_active and (tgt.last_active is None or h.last_active > tgt.last_active):
-            tgt.last_active = h.last_active
-        for m, ms in h.modules.items():
-            t = tgt.modules.setdefault(m, type(ms)())
-            t.commits += ms.commits
-            t.weight += ms.weight
-            if ms.last and (t.last is None or ms.last > t.last):
-                t.last = ms.last
+def _request_reviewers(
+    owner: str, name: str, pr_number: int, top: list[Candidate],
+    already: set[str], enabled: bool, dry_run: bool,
+) -> Requests:
+    out = Requests(enabled=enabled, dry_run=dry_run)
+    if not enabled:
+        return out
+    for c in top:
+        login = c.key.lower()
+        if login in already:
+            out.already.append(login)
+        elif dry_run:
+            out.requested.append(login)
+        else:
+            try:
+                # One request per reviewer, and `reviewers[]` so that gh sends an
+                # array. `-f reviewers=a,b` sends the string "a,b", which the API
+                # rejects with 422 "... is not an array". Asking one at a time
+                # keeps a single non-requestable reviewer from voiding the rest.
+                gh_api([
+                    "api", "-X", "POST",
+                    f"repos/{owner}/{name}/pulls/{pr_number}/requested_reviewers",
+                    "-f", f"reviewers[]={login}",
+                ])
+                out.requested.append(login)
+            except GhError as e:
+                out.failed.append((login, _reason(e)))
     return out
 
 
-def _render(cands, modules, cfg, pr_number) -> str:
-    lines = [
-        "## 🤖 Reviewer 推荐",
-        "",
-        f"本 PR 涉及模块：`{'`, `'.join(m for m in modules if m != UNASSIGNED) or UNASSIGNED}`",
-        "",
-    ]
+_STATUS_AT_END = re.compile(r"\s*\(HTTP (\d{3})\)\s*$")
+
+
+def _reason(err: GhError) -> str:
+    """The API's own first sentence with its status, e.g. 'Reviews may only be
+    requested from collaborators. (HTTP 422)'."""
+    lines = err.stderr.splitlines()
+    line = lines[0].strip() if lines else ""
+    if line.lower().startswith("gh: "):
+        line = line[4:]
+    status = ""
+    if m := _STATUS_AT_END.search(line):
+        status, line = f" (HTTP {m.group(1)})", line[: m.start()]
+    line = " ".join(line.split())
+    if ". " in line:  # GitHub appends an explanation; the first sentence says it
+        line = line.split(". ", 1)[0] + "."
+    elif len(line) > 120:
+        line = line[:120].rstrip() + "…"
+    return f"{line}{status}".strip() or (f"HTTP {err.status}" if err.status else "gh failed")
+
+
+# ---------- comment ----------
+
+def _token_login() -> str | None:
+    """Account behind the token, when the token may read it. GITHUB_TOKEN may
+    refuse (`403`); the caller then falls back to matching by bot author."""
+    try:
+        login = gh_api(["api", "user", "--jq", ".login"], retries=1).strip()
+    except GhError:
+        return None
+    return login.lower() or None
+
+
+def _existing_comment_id(owner: str, name: str, pr_number: int, me: str | None) -> int | None:
+    """Id of the recommendation comment posted earlier, if any.
+
+    "Ours" = starts with our title (or the one earlier versions used) and
+    authored by the token's own account. When that account is unknown, any bot
+    account counts: comments written with GITHUB_TOKEN belong to
+    `github-actions[bot]`, a GitHub App writes as `<app>[bot]`.
+    """
+    titles = " or ".join(
+        f"startswith({json.dumps(t, ensure_ascii=False)})" for t in (MARKER, *OLD_MARKERS)
+    )
+    rows = gh_json_values([
+        "api", "--paginate", f"repos/{owner}/{name}/issues/{pr_number}/comments",
+        "--jq", f".[] | select(.body | {titles}) | {{id, login: .user.login}}",
+    ])
+    mine = None
+    for c in rows:
+        login = (c.get("login") or "").lower()
+        if not login:
+            continue
+        # `me[bot]` too: should the API ever let an installation token read
+        # `/user`, its comments are still authored as "<app>[bot]".
+        ours = login in (me, f"{me}[bot]") if me is not None else login.endswith("[bot]")
+        if ours:
+            mine = c["id"]     # keep the most recent one
+    return mine
+
+
+def _post_comment(owner: str, name: str, pr_number: int, body: str) -> None:
+    """Create the recommendation comment, or edit ours in place (re-runs and
+    force-pushes do not pile up comments)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", encoding="utf-8", delete=False) as f:
+        f.write(body)
+        path = f.name
+    try:
+        prior = _existing_comment_id(owner, name, pr_number, _token_login())
+        if prior:
+            gh_api(["api", "-X", "PATCH", f"repos/{owner}/{name}/issues/comments/{prior}",
+                    "-F", f"body=@{path}"])
+            print(f"updated recommendation comment {prior} in place")
+        else:
+            gh_api(["api", "-X", "POST", f"repos/{owner}/{name}/issues/{pr_number}/comments",
+                    "-F", f"body=@{path}"])
+            print("posted recommendation comment")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+# ---------- rendering ----------
+
+def _render(
+    cands: list[Candidate], modules: list[str], cfg: Config, outcome: Requests, ident=None
+) -> str:
+    show = ident.display if ident else (lambda login: login)
+    named = [m for m in modules if m != UNASSIGNED]
+    lines = [MARKER, "", _modules_line(named), ""]
     if cfg.is_low_confidence(cands[0].evidence_count):
-        lines += [
-            "> ⚠️ **低置信度**：该区域历史信号稀疏（最佳候选在该模块仅 "
-            f"{cands[0].evidence_count} 次 commit/review 记录），推荐仅供参考，"
-            "建议结合团队实际分工判断。",
-            "",
-        ]
-    lines += [
-        "| Reviewer | 分数 | 依据 |",
-        "|---|---|---|",
-    ]
-    for c in cands[: cfg.top_n]:
-        bits = []
-        for m, (nc, _cw, nr, _rw) in sorted(
-            c.module_detail.items(), key=lambda kv: -(kv[1][1] + kv[1][3])
-        ):
-            parts = []
-            if nc:
-                parts.append(f"{nc} commits")
-            if nr:
-                parts.append(f"{nr} reviews")
-            if parts:
-                bits.append(f"`{m}` " + "+".join(parts))
-        why = " · ".join(bits) or "-"
-        if c.coupling > 0:
-            why += " · **跨模块覆盖**"
-        if c.seams:
-            why += " · " + "、".join(f"`{s}`" for s in c.seams[:2]) + " 接缝"
-        if c.pending:
-            why += f" · 待审 {c.pending}"
-        lines.append(f"| @{c.key} | {c.score:.1f} | {why} |")
+        # `(root)` is not counted as evidence, so for a PR outside every module
+        # the count is 0 by construction: say what is actually the matter.
+        why = (f"the top candidate has only {cands[0].evidence_count} commits and reviews in "
+               "the modules this PR touches" if named else
+               "this PR touches no module, so there is no module history to go by")
+        lines += [f"> ⚠️ **Low confidence**: {why}. Treat the list as a starting point.", ""]
+    lines += ["| Reviewer | Score | Why |", "|---|---|---|"]
+    for c in cands:
+        lines.append(f"| @{show(c.key)} | {c.score:.1f} | {_why(c)} |")
+    # What became of the review requests stays out of the fold: it is the part
+    # the reader may have to act on.
+    lines += ["", *_footer(outcome, show)]
+    if lines[-1] == "":
+        lines.pop()
     lines += [
         "",
-        "<details><summary>评分依据（可折叠）</summary>",
+        "<details><summary>How the score is computed</summary>",
         "",
-        "信号 = 该模块内的 commit 历史 + 历史 review 记录（均按时间半衰期 180 天衰减加权）；",
-        "跨模块 PR 对在所有涉及模块均有贡献者额外加分。自动请求了上表 reviewer。",
+        "Commits and reviews in the modules this PR touches, each weighted by a "
+        f"{cfg.halflife_days:.0f}-day half-life. A PR that touches several modules adds a "
+        "bonus for people with history in every one of them, and for people with history "
+        "on both sides of a dependency between a touched module and its neighbours. "
+        "People with several reviews waiting rank lower.",
         "</details>",
     ]
     return "\n".join(lines)
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
+def _join(items) -> str:
+    """'a', 'a and b', 'a, b and c'."""
+    items = list(items)
+    return ", ".join(items[:-1]) + " and " + items[-1] if len(items) > 1 else items[0]
+
+
+def _modules_line(named: list[str]) -> str:
+    """`named`: the modules the PR touches, without `(root)`."""
+    if not named:
+        return "This PR touches no module: its files are outside every module found in the repository."
+    return f"This PR touches {_join(f'`{m}`' for m in named)}."
+
+
+def _why(c: Candidate) -> str:
+    bits = []
+    for m, (nc, _cw, nr, _rw) in sorted(
+        c.module_detail.items(), key=lambda kv: -(kv[1][1] + kv[1][3])
+    ):
+        parts = [_count(n, noun) for n, noun in ((nc, "commit"), (nr, "review")) if n]
+        if parts:
+            bits.append(f"`{m}` " + ", ".join(parts))
+    why = " · ".join(bits) or "-"
+    if c.coupling > 0:
+        why += " · **history in every touched module**"
+    if c.seams:
+        why += " · on both sides of " + _join(f"`{s}`" for s in c.seams[:2])
+    if c.pending:
+        why += f" · {_count(c.pending, 'review')} pending"
+    return why
+
+
+def _footer(outcome: Requests, show) -> list[str]:
+    at = lambda logins: _join(f"@{show(x)}" for x in logins)  # noqa: E731
+    if not outcome.enabled:
+        return ["No review was requested (`request-reviewers: false`)."]
+    parts = []
+    if outcome.requested:
+        parts.append(("Would request reviews from" if outcome.dry_run else "Reviews requested from")
+                     + f" {at(outcome.requested)}.")
+    if outcome.already:
+        parts.append(f"Already requested: {at(outcome.already)}.")
+    if outcome.failed:   # a dry run makes no requests, so none can fail in it
+        by_reason: dict[str, list[str]] = {}   # one sentence per distinct reason
+        for login, reason in outcome.failed:
+            by_reason.setdefault(reason, []).append(login)
+        for reason, logins in by_reason.items():
+            parts.append(f"Could not request a review from {at(logins)} ({reason}); "
+                         f"add {at(logins)} in the Reviewers box.")
+    return [" ".join(parts)] if parts else []
 
 
 if __name__ == "__main__":

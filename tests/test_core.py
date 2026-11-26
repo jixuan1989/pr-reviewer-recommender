@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 import datetime as dt
+import os
+import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from reviewer_recommender.config import Config, UNASSIGNED
 from reviewer_recommender.deps import build_dep_graph
-from reviewer_recommender.history import ModuleSignal, collect_history
+from reviewer_recommender.history import ModuleSignal, collect_history, parse_time
 from reviewer_recommender.modules import build_module_map
 from reviewer_recommender.score import recommend
 
@@ -42,6 +45,37 @@ def test_module_map_fallback_top_dirs(tmp_path):
     assert m.of("a/x.py") == "a"
 
 
+def test_build_output_dirs_are_skipped_by_exact_name(tmp_path):
+    """`dist` is build output; `distribution` is a module of its own."""
+    for d in ("distribution", "dist", "build", "server"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "pom.xml").write_text(
+        "<project><modules><module>distribution</module><module>dist</module>"
+        "<module>server</module></modules></project>"
+    )
+    assert set(build_module_map(tmp_path).modules) == {"distribution", "server"}
+
+
+# ---------- configuration ----------
+
+@pytest.mark.parametrize("login", ["dependabot[bot]", "github-actions", "codecov-commenter",
+                                   "renovate-bot", "Copilot", "semantic-release", "ci[bot] <ci@x>"])
+def test_bots_are_recognised(login):
+    assert CFG.is_bot(login)
+
+
+@pytest.mark.parametrize("login", ["Talbot", "robotman", "abby", "abb", "bob", "Bottom",
+                                   "codecove", "AllBotsAreHere"])
+def test_people_whose_handle_contains_a_bot_word_are_not_bots(login):
+    assert not CFG.is_bot(login)
+
+
+def test_timestamps_with_and_without_zone():
+    assert parse_time("2026-11-03T07:04:59Z") == dt.datetime(2026, 11, 3, 7, 4, 59, tzinfo=dt.timezone.utc)
+    assert parse_time("2026-11-03T15:04:59+08:00") == parse_time("2026-11-03T07:04:59Z")
+    assert parse_time("2026-11-03T07:04:59").tzinfo == dt.timezone.utc   # bare stamps are UTC
+
+
 # ---------- scoring ----------
 
 def _hist(author, module, commits, days_ago=10):
@@ -73,6 +107,15 @@ def test_recommend_filters():
     assert "bob[bot]" not in str(names)
     assert "author" not in names
     assert names[0] == "alice"
+
+
+def test_pr_author_is_excluded_by_login_whatever_the_case():
+    """History keyed by GitHub login, as the action passes it in."""
+    hist = {}
+    for login in ("alice", "ALICE", "bob"):
+        hist.update(_hist(f"{login} <{login}@x>", "m1", 5))
+    keys = [c.key for c in recommend(["m1"], hist, None, CFG, REF, pr_author="Alice")]
+    assert keys == ["bob"]
 
 
 def test_touched_modules_filters_root():
@@ -190,3 +233,59 @@ def test_collect_history(tmp_path):
     h = collect_history(repo, mmap, CFG, REF)
     assert "alice <a@x>" in h
     assert h["alice <a@x>"].modules["src"].commits == 1
+
+
+def test_the_same_pr_gets_the_same_recommendation_in_every_process():
+    """Set iteration order changes from one process to the next (hash
+    randomisation). Nothing that ends up in the comment may depend on it."""
+    code = """
+import datetime as dt, sys
+sys.path.insert(0, ".")
+from reviewer_recommender.config import Config
+from reviewer_recommender.history import AuthorHistory, ModuleSignal
+from reviewer_recommender.score import recommend
+
+names = ["a", "bb", "ccc", "dddd", "e5", "f6", "g7", "h8"]
+mods = ["java/common", "java/tsfile", "java/tools", "java/examples", "java/x", "java/y"]
+history = {}
+for i, n in enumerate(names):
+    h = AuthorHistory(total_commits=1)
+    for j, m in enumerate(mods):
+        if (i + j) % 3:                      # a different subset for everyone, all of equal weight
+            h.modules[m] = ModuleSignal(commits=2, weight=1.0)
+    history[f"{n} <{n}@x>"] = h
+adj = {m: {mods[(k + 1) % len(mods)], mods[(k + 2) % len(mods)]} for k, m in enumerate(mods)}
+out = recommend(mods[:3], history, None, Config(),
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), dep_adj=adj)
+print([(c.key, c.score, list(c.module_detail), c.seams) for c in out])
+"""
+    seen = set()
+    for seed in ("0", "1", "2", "3", "4", "5"):
+        run = subprocess.run(
+            [sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, check=True,
+        )
+        seen.add(run.stdout)
+    assert len(seen) == 1, f"{len(seen)} different recommendations for one pull request"
+
+
+def test_action_file_checks_out_the_base_commit_only_and_wires_every_input():
+    """action.yml runs on pull_request_target with a write token, and nothing
+    here is exercised by the other tests. Three properties are load-bearing and
+    easy to undo with a well-meant edit: the checkout is of the PR's base commit
+    (never the PR head or the default branch), it leaves no credentials behind,
+    and the checkout action is pinned to a commit. An input that is declared but
+    not passed on would be a knob that silently does nothing."""
+    text = (Path(__file__).resolve().parents[1] / "action.yml").read_text(encoding="utf-8")
+    checkout = re.search(r"^\s*uses:\s*(\S+)", text, flags=re.M)
+    assert checkout and re.fullmatch(r"actions/checkout@[0-9a-f]{40}", checkout.group(1))
+    assert re.findall(r"^\s*ref:\s*(.+?)\s*$", text, flags=re.M) == [
+        "${{ github.event.pull_request.base.sha }}"
+    ]
+    assert re.search(r"^\s*persist-credentials:\s*false\s*$", text, flags=re.M)
+    declared = text.split("\ninputs:", 1)[1].split("\nruns:", 1)[0]
+    names = re.findall(r"^  ([a-z0-9-]+):\s*$", declared, flags=re.M)
+    assert names, "no inputs found: the layout of action.yml changed"
+    for name in names:
+        assert "${{ inputs." + name + " }}" in text, f"input {name!r} is declared but never used"

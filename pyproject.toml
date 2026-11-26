@@ -7,3 +7,4 @@ dependencies = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]   # a bare `pytest` must find the package without installing it

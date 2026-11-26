@@ -1,8 +1,14 @@
-# 目标仓库放这里的副本: .github/workflows/reviewer-recommend.yml
+# SPDX-License-Identifier: Apache-2.0
+# Usage: copy to .github/workflows/reviewer-recommend.yml of the target repository and commit
+# it to the default branch: pull_request_target only fires for a workflow file that lives
+# there. See "Usage as a GitHub Action" in README.md.
 name: reviewer-recommend
+
 on:
-  pull_request:
-    types: [opened]
+  pull_request_target:
+    types: [opened, ready_for_review]
+    # To run again when the PR gets new commits, add synchronize: the comment is edited in
+    # place, and reviewers who were already requested stay requested.
 
 permissions:
   contents: read
@@ -10,14 +16,29 @@ permissions:
 
 jobs:
   recommend:
+    # Drafts wait until they are marked ready for review (the ready_for_review event).
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      # 本地 action（uses: ./...）必须先 checkout；远程 uses: owner/repo@v1 也建议
-      # 显式 checkout（fetch-depth: 0 需要全量历史），action 内部的 checkout 是幂等的
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/reviewer-recommender   # 或 uses: YOUR_FORK/pr-reviewer-recommender@main
+      # Remote action: replace OWNER with the repository owner and pin the full commit SHA.
+      # The action checks out the PR's base commit (full history) itself. Nothing from the
+      # PR is checked out or run.
+      - uses: OWNER/pr-reviewer-recommender@FULL_COMMIT_SHA
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          top-n: '3'
+          # top-n: '3'                  # how many reviewers to recommend and request (at least 2)
+          # request-reviewers: 'false'  # post the comment only
+          # dry-run: 'true'             # print to the log only; write nothing
+
+      # Vendored form (action.yml, reviewer_recommender/ and LICENSE copied to
+      # .github/actions/reviewer-recommender/): use these two steps instead. The local action
+      # is read from the PR's base commit, so the directory has to exist on the base branch.
+      # The job holds a write token, so pin actions/checkout to a commit SHA here as well.
+      # - uses: actions/checkout@v4
+      #   with:
+      #     ref: ${{ github.event.pull_request.base.sha }}
+      #     fetch-depth: 0
+      #     persist-credentials: false
+      # - uses: ./.github/actions/reviewer-recommender
+      #   with:
+      #     github-token: ${{ secrets.GITHUB_TOKEN }}

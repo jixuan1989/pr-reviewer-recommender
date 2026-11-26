@@ -18,6 +18,8 @@ BUILD_MARKERS = (
     "go.mod", "CMakeLists.txt", "pyproject.toml", "setup.py",
     "package.json", "Cargo.toml", "build.gradle", "Makefile",
 )
+# Compared by exact directory name. A prefix test used to swallow real source
+# trees such as a "distribution" module (it starts with "dist").
 SKIP_DIRS = (".git", ".github", "target", "node_modules", "build", "out", "dist")
 
 
@@ -70,7 +72,7 @@ def _poms_upto(root: Path, max_depth: int = 2) -> list[Path]:
         except OSError:
             return
         for e in entries:
-            if e.is_dir() and not e.name.startswith(SKIP_DIRS):
+            if e.is_dir() and e.name not in SKIP_DIRS:
                 walk(e, depth + 1)
 
     walk(root, 0)
@@ -78,7 +80,7 @@ def _poms_upto(root: Path, max_depth: int = 2) -> list[Path]:
 
 
 def _dir_ok(d: Path) -> bool:
-    return d.is_dir() and not d.name.startswith(SKIP_DIRS)
+    return d.is_dir() and d.name not in SKIP_DIRS
 
 
 def build_module_map(root: Path) -> ModuleMap:

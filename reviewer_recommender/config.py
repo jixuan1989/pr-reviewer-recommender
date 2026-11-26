@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass, field
 
-BOT_PATTERNS = ("[bot]", "bot", "github-actions", "dependabot", "renovate", "codecov", "semantic-release", "copilot")
+# Bot detection works on words, not substrings: a login is a bot when one of its
+# words (split on anything that is not a letter or digit) is a bot word, or when
+# the whole login is a bot account. GitHub Apps are always "<app>[bot]". A bare
+# substring test would also catch people whose handle merely contains "bot".
+BOT_WORDS = ("bot", "codecov", "copilot", "dependabot", "renovate")
+# Accounts whose name gives nothing away.
+BOT_ACCOUNTS = ("github-actions", "semantic-release", "github-advanced-security")
 UNASSIGNED = "(root)"
 
 
@@ -13,7 +20,7 @@ UNASSIGNED = "(root)"
 class Config:
     halflife_days: float = 180.0
     commit_weight: float = 1.0        # λc
-    review_weight: float = 2.5        # λr（调参结论：review 行为是最强预测信号，2026-11-05 网格搜索）
+    review_weight: float = 2.5        # λr：唯一明显影响命中率的参数（2026-11-05 调参，2026-11-25 复核，DESIGN.md §8）
     coupling_weight: float = 0.5      # λx
     dep_weight: float = 0.3           # λd：依赖接缝加成（v2）
     workload_factor: float = 0.75     # 每个挂起 review 请求对总分的乘数（v2）
@@ -23,7 +30,8 @@ class Config:
     window_days: int = 365            # 信号采集窗口
     inactive_days: int = 365          # 超过该天数无动作则排除
     top_n: int = 3
-    bot_patterns: tuple[str, ...] = field(default_factory=lambda: BOT_PATTERNS)
+    bot_words: tuple[str, ...] = field(default_factory=lambda: BOT_WORDS)
+    bot_accounts: tuple[str, ...] = field(default_factory=lambda: BOT_ACCOUNTS)
 
     def touched_modules(self, modules) -> list[str]:
         """Scoring view of a module set: infra/(root) excluded unless it is all there is."""
@@ -47,5 +55,13 @@ class Config:
         return 0.5 ** (age_days / self.halflife_days)
 
     def is_bot(self, identity: str) -> bool:
-        low = identity.lower()
-        return any(p in low for p in self.bot_patterns)
+        """True for automation accounts. Accepts a login or a git identity
+        ("Name <email>" — only the name part is looked at)."""
+        login = identity.split(" <", 1)[0].strip().lower()
+        if login in self.bot_accounts:
+            return True
+        return any(w in _words(login) for w in self.bot_words)
+
+
+def _words(login: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", login) if w}

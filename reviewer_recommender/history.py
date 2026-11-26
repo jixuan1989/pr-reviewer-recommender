@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """git-log based authorship signals per module.
 
-Identity: "Name <email>" (login resolution happens in API/action mode).
+Identity here is the git author, "Name <email>"; mapping it to a GitHub login
+needs the API (see reviewlog.IdentityIndex).
+
+Time semantics: the window (`--since`/`--before`) filters on the committer date,
+as the commits API does; decay and "last active" use the author date.
 """
 from __future__ import annotations
 
@@ -15,6 +19,12 @@ from .config import Config
 from .modules import ModuleMap
 
 SEP = "\x1f"
+
+
+def parse_time(stamp: str) -> dt.datetime:
+    """GitHub ISO-8601 timestamp ('2026-11-03T07:04:59Z') -> aware datetime (UTC)."""
+    t = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
 @dataclass
@@ -37,6 +47,13 @@ class AuthorHistory:
     total_commits: int = 0
 
 
+def head_commit(repo: Path) -> str:
+    """Full SHA of the checked-out commit, the one whose history `git_log` reads."""
+    proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, check=True, encoding="utf-8")
+    return proc.stdout.strip()
+
+
 def git_log(repo: Path, since: str, before: str | None = None) -> list[tuple[str, dt.datetime, list[str]]]:
     """[(author, date, [files])] in chronological reach of git log."""
     args = [
@@ -45,7 +62,7 @@ def git_log(repo: Path, since: str, before: str | None = None) -> list[tuple[str
     ]
     if before:
         args.append(f"--before={before}")
-    proc = subprocess.run(args, capture_output=True, text=True, check=True)
+    proc = subprocess.run(args, capture_output=True, check=True, encoding="utf-8")
     out: list[tuple[str, dt.datetime, list[str]]] = []
     author: str | None = None
     when: dt.datetime | None = None
